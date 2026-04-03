@@ -186,8 +186,8 @@ const TIERS = [
    On soumet N frames et on attend que le GPU
    finisse via onSubmittedWorkDone()
 ═══════════════════════════════════════════ */
-const BENCH_FRAMES  = 35;   // frames par test
-const FPS_THRESHOLD = 52;   // fps min pour valider un tier
+const BENCH_FRAMES  = 40;   // frames par test
+const FPS_THRESHOLD = 95;   // fps min pour valider un tier
 
 // ── Benchmark shader fullscreen (plasma / lissajous / raymarcher) ──
 async function benchShader(device, fmt, ctx, wgsl) {
@@ -228,7 +228,7 @@ async function benchShader(device, fmt, ctx, wgsl) {
 
 // ── Benchmark compute (vortex) ──
 async function benchCompute(device, fmt, ctx) {
-  const nb = 50000;
+  const nb = 150000;
   const mb = device.createBuffer({size:8, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
   const code=`
 struct P{pos:vec2f,vel:vec2f,a:f32,b:f32,c:f32,d:f32}

@@ -181,36 +181,228 @@ const TIERS = [
   }
 ];
 
-function detectTier(lim) {
-  const wg  = lim.maxComputeWorkgroupSizeX || 256;
-  const buf = lim.maxStorageBufferBindingSize || 268435456;
-  if (wg >= 1024 && buf >= 1500000000) return 3;
-  if (wg >= 512  && buf >= 800000000)  return 2;
-  if (wg >= 256  && buf >= 100000000)  return 1;
-  return 0;
+/* ═══════════════════════════════════════════
+   BENCHMARK RÉEL — mesure FPS GPU par tier
+   On soumet N frames et on attend que le GPU
+   finisse via onSubmittedWorkDone()
+═══════════════════════════════════════════ */
+const BENCH_FRAMES  = 35;   // frames par test
+const FPS_THRESHOLD = 52;   // fps min pour valider un tier
+
+// ── Benchmark shader fullscreen (plasma / lissajous / raymarcher) ──
+async function benchShader(device, fmt, ctx, wgsl) {
+  const ub  = device.createBuffer({size:32, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  const bgl = device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.FRAGMENT,buffer:{}}]});
+  const mod = device.createShaderModule({code:wgsl});
+  const pip = device.createRenderPipeline({
+    layout: device.createPipelineLayout({bindGroupLayouts:[bgl]}),
+    vertex:   {module:mod, entryPoint:'vs'},
+    fragment: {module:mod, entryPoint:'fs', targets:[{format:fmt}]},
+    primitive:{topology:'triangle-list'}
+  });
+  const bg = device.createBindGroup({layout:bgl,entries:[{binding:0,resource:{buffer:ub}}]});
+
+  // warm-up : 3 frames pour chauffer le pipeline
+  for(let i=0;i<3;i++){
+    device.queue.writeBuffer(ub,0,new Float32Array([i*.016,800,450,1,0.5,0.8,0,0]));
+    const enc=device.createCommandEncoder();
+    const p=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
+    p.setPipeline(pip);p.setBindGroup(0,bg);p.draw(3);p.end();
+    device.queue.submit([enc.finish()]);
+  }
+  await device.queue.onSubmittedWorkDone();
+
+  // mesure réelle
+  const t0 = performance.now();
+  for(let i=0;i<BENCH_FRAMES;i++){
+    device.queue.writeBuffer(ub,0,new Float32Array([i*.016,800,450,1,0.5,0.8,0,0]));
+    const enc=device.createCommandEncoder();
+    const p=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
+    p.setPipeline(pip);p.setBindGroup(0,bg);p.draw(3);p.end();
+    device.queue.submit([enc.finish()]);
+  }
+  await device.queue.onSubmittedWorkDone();
+  ub.destroy();
+  return Math.round(BENCH_FRAMES / ((performance.now()-t0)/1000));
 }
 
-/* ═══════════════════════════════════════════
-   SCAN UI
-═══════════════════════════════════════════ */
-async function runScan(adapter, lim) {
-  const rows = [
-    { key:'MAX WORKGROUP SIZE', val:`${lim.maxComputeWorkgroupSizeX} threads`, pct:lim.maxComputeWorkgroupSizeX/1024*100 },
-    { key:'MAX BUFFER SIZE',    val:`${Math.round(lim.maxStorageBufferBindingSize/1048576)} MB`, pct:lim.maxStorageBufferBindingSize/2147483648*100 },
-    { key:'MAX TEXTURE',        val:`${lim.maxTextureDimension2D} px`, pct:lim.maxTextureDimension2D/16384*100 },
-    { key:'BIND GROUPS',        val:`${lim.maxBindGroups}`, pct:lim.maxBindGroups/8*100 },
-  ];
-  const wrap = document.getElementById('scan-rows');
-  wrap.innerHTML = rows.map(r=>`
-    <div class="scan-line"><div class="scan-line-fill" data-pct="${Math.min(100,r.pct).toFixed(0)}"></div></div>
-    <div class="scan-key"><span>${r.key}</span><span class="scan-val">${r.val}</span></div>
-  `).join('');
-  // anime les barres une à une
-  const fills = wrap.querySelectorAll('.scan-line-fill');
-  for (const fill of fills) {
-    await new Promise(r=>setTimeout(r,320));
-    fill.style.width = fill.dataset.pct + '%';
+// ── Benchmark compute (vortex) ──
+async function benchCompute(device, fmt, ctx) {
+  const nb = 50000;
+  const mb = device.createBuffer({size:8, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  const code=`
+struct P{pos:vec2f,vel:vec2f,a:f32,b:f32,c:f32,d:f32}
+struct M{pos:vec2f}
+@group(0)@binding(0) var<storage,read>       pin:array<P>;
+@group(0)@binding(1) var<storage,read_write> pout:array<P>;
+@group(0)@binding(2) var<uniform> m:M;
+@compute @workgroup_size(64)
+fn cp(@builtin(global_invocation_id) id:vec3u){
+  var p=pin[id.x];
+  let d=m.pos-p.pos;let dist=length(d);
+  if(dist<0.5&&dist>0.001){p.vel+=normalize(d)*0.0004*(1.0-dist/0.5);}
+  let cs=cos(0.0005);let sn=sin(0.0005);
+  p.vel=vec2f(p.vel.x*cs-p.vel.y*sn,p.vel.x*sn+p.vel.y*cs);
+  p.vel*=0.987;p.pos+=p.vel;
+  if(p.pos.x<-1.0){p.pos.x=1.0;}if(p.pos.x>1.0){p.pos.x=-1.0;}
+  if(p.pos.y<-1.0){p.pos.y=1.0;}if(p.pos.y>1.0){p.pos.y=-1.0;}
+  pout[id.x]=p;
+}
+struct V{@builtin(position) pos:vec4f,@location(0) col:f32}
+@vertex fn vs(@builtin(instance_index) i:u32,@builtin(vertex_index) v:u32)->V{
+  let p=pin[i];let s=0.005+length(p.vel)*0.2;
+  var uvs=array<vec2f,6>(vec2f(-1,1),vec2f(1,1),vec2f(-1,-1),vec2f(-1,-1),vec2f(1,1),vec2f(1,-1));
+  return V(vec4f(p.pos+uvs[v]*s,0.0,1.0),length(p.vel)*60.0);
+}
+@fragment fn fs(@location(0) c:f32)->@location(0) vec4f{return vec4f(c*.3,c*.1,c,0.5);}`;
+  const mod=device.createShaderModule({code});
+  const bufA=device.createBuffer({size:nb*32,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const bufB=device.createBuffer({size:nb*32,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const init=new Float32Array(nb*8);
+  for(let i=0;i<nb*8;i+=8){const r=Math.sqrt(Math.random())*.85,a=Math.random()*6.28;init[i]=r*Math.cos(a);init[i+1]=r*Math.sin(a);}
+  device.queue.writeBuffer(bufA,0,init);
+  const layout=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:GPUShaderStage.COMPUTE|GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}},
+    {binding:1,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage'}},
+    {binding:2,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}}
+  ]});
+  const pl=device.createPipelineLayout({bindGroupLayouts:[layout]});
+  const cp2=device.createComputePipeline({layout:pl,compute:{module:mod,entryPoint:'cp'}});
+  const rp2=device.createRenderPipeline({
+    layout:pl,vertex:{module:mod,entryPoint:'vs'},
+    fragment:{module:mod,entryPoint:'fs',targets:[{format:fmt,blend:{color:{srcFactor:'src-alpha',dstFactor:'one',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},
+    primitive:{topology:'triangle-list'}
+  });
+  const bgA2=device.createBindGroup({layout,entries:[{binding:0,resource:{buffer:bufA}},{binding:1,resource:{buffer:bufB}},{binding:2,resource:{buffer:mb}}]});
+  const bgB2=device.createBindGroup({layout,entries:[{binding:0,resource:{buffer:bufB}},{binding:1,resource:{buffer:bufA}},{binding:2,resource:{buffer:mb}}]});
+
+  // warm-up
+  for(let i=0;i<3;i++){
+    const bg=i%2===0?bgA2:bgB2;
+    const enc=device.createCommandEncoder();
+    const p1=enc.beginComputePass();p1.setPipeline(cp2);p1.setBindGroup(0,bg);p1.dispatchWorkgroups(Math.ceil(nb/64));p1.end();
+    const p2=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:.02,a:1},loadOp:'clear',storeOp:'store'}]});
+    p2.setPipeline(rp2);p2.setBindGroup(0,bg);p2.draw(6,nb);p2.end();
+    device.queue.submit([enc.finish()]);
   }
+  await device.queue.onSubmittedWorkDone();
+
+  const t0=performance.now();
+  for(let i=0;i<BENCH_FRAMES;i++){
+    const bg=i%2===0?bgA2:bgB2;
+    const enc=device.createCommandEncoder();
+    const p1=enc.beginComputePass();p1.setPipeline(cp2);p1.setBindGroup(0,bg);p1.dispatchWorkgroups(Math.ceil(nb/64));p1.end();
+    const p2=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:.02,a:1},loadOp:'clear',storeOp:'store'}]});
+    p2.setPipeline(rp2);p2.setBindGroup(0,bg);p2.draw(6,nb);p2.end();
+    device.queue.submit([enc.finish()]);
+  }
+  await device.queue.onSubmittedWorkDone();
+  bufA.destroy();bufB.destroy();mb.destroy();
+  return Math.round(BENCH_FRAMES/((performance.now()-t0)/1000));
+}
+
+// ── Shaders de benchmark ──
+const BENCH_PLASMA=`
+struct U{t:f32,rw:f32,rh:f32,cr:f32,cg:f32,cb:f32,p0:f32,p1:f32}
+@group(0)@binding(0) var<uniform> u:U;
+@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{let p=array<vec2f,3>(vec2f(-4,-1),vec2f(4,-1),vec2f(0,4));return vec4f(p[i],0.0,1.0);}
+@fragment fn fs(@builtin(position) fc:vec4f)->@location(0) vec4f{
+  let uv=(fc.xy/vec2f(u.rw,u.rh))*2.0-vec2f(1.0);let t=u.t;
+  let v=(sin(uv.x*6.+t)+sin(uv.y*6.+t*.7)+sin((uv.x+uv.y)*4.+t*.9)+sin(sqrt(uv.x*uv.x+uv.y*uv.y)*7.-t*1.2))*0.5;
+  let n=v*.5+.5;return vec4f(n*.6,n*.2,n*.9,1.0);
+}`;
+
+const BENCH_LISSAJOUS=`
+struct U{t:f32,rw:f32,rh:f32,cr:f32,cg:f32,cb:f32,p0:f32,p1:f32}
+@group(0)@binding(0) var<uniform> u:U;
+@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{let p=array<vec2f,3>(vec2f(-4,-1),vec2f(4,-1),vec2f(0,4));return vec4f(p[i],0.0,1.0);}
+fn lis(uv:vec2f,a:f32,b:f32,d:f32,t:f32)->f32{var m=9999.0;var prev=vec2f(sin(d),0.0);for(var i=1;i<=120;i++){let phi=f32(i)/120.0*6.283;let cur=vec2f(sin(a*phi+d+t*.3),sin(b*phi+t*.2));let ab=cur-prev;let ap=uv-prev;let tt=clamp(dot(ap,ab)/dot(ab,ab),0.0,1.0);m=min(m,length(ap-ab*tt));prev=cur;}return m;}
+@fragment fn fs(@builtin(position) fc:vec4f)->@location(0) vec4f{
+  let res=vec2f(u.rw,u.rh);let uv=(fc.xy/res*2.0-vec2f(1.0))*vec2f(res.x/res.y,1.0);
+  var g=0.0;
+  g+=0.01/max(lis(uv,3.,2.,0.,u.t),0.0001);
+  g+=0.008/max(lis(uv,3.,4.,1.57,u.t),0.0001);
+  g+=0.006/max(lis(uv,5.,4.,0.8,u.t),0.0001);
+  return vec4f(clamp(g,0.,2.)*vec3f(.3,.9,.6),1.0);
+}`;
+
+const BENCH_RAYMARCH=`
+struct U{t:f32,rw:f32,rh:f32,cr:f32,cg:f32,cb:f32,p0:f32,p1:f32}
+@group(0)@binding(0) var<uniform> u:U;
+@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{let p=array<vec2f,3>(vec2f(-4,-1),vec2f(4,-1),vec2f(0,4));return vec4f(p[i],0.0,1.0);}
+fn sdSphere(p:vec3f,r:f32)->f32{return length(p)-r;}
+fn sdTorus(p:vec3f,R:f32,r:f32)->f32{return length(vec2f(length(p.xz)-R,p.y))-r;}
+fn smin(a:f32,b:f32,k:f32)->f32{let h=max(k-abs(a-b),0.)/k;return min(a,b)-h*h*k*.25;}
+fn map(p:vec3f)->f32{
+  var d=p.y+1.2;
+  let ta=u.t*.5;var tp=vec3f(p.x*cos(ta)-p.z*sin(ta),p.y,p.x*sin(ta)+p.z*cos(ta));
+  d=smin(d,sdTorus(tp,.8,.22),.1);
+  d=smin(d,sdSphere(p-vec3f(0.,abs(sin(u.t*.8))*.5-.3,.0),.3),.2);
+  return d;
+}
+fn calcN(p:vec3f)->vec3f{let e=.001;return normalize(vec3f(map(p+vec3f(e,0,0))-map(p-vec3f(e,0,0)),map(p+vec3f(0,e,0))-map(p-vec3f(0,e,0)),map(p+vec3f(0,0,e))-map(p-vec3f(0,0,e))));}
+@fragment fn fs(@builtin(position) fc:vec4f)->@location(0) vec4f{
+  let res=vec2f(u.rw,u.rh);let uv=(fc.xy*2.-res)/res.y;
+  let ro=vec3f(sin(u.t*.3)*3.5,.8,cos(u.t*.3)*3.5);
+  let fwd=normalize(-ro);let rgt=normalize(cross(vec3f(0,1,0),fwd));let upv=cross(fwd,rgt);
+  let rd=normalize(fwd+uv.x*rgt+uv.y*upv);
+  var t2=0.0;var hit=false;
+  for(var i=0;i<60;i++){let h=map(ro+rd*t2);if(h<.001){hit=true;break;}t2+=h;if(t2>20.){break;}}
+  var col=vec3f(.02,.01,.05);
+  if(hit){let p2=ro+rd*t2;let n=calcN(p2);let l=normalize(vec3f(2.,4.,1.));col=vec3f(.5,.15,.9)*max(dot(n,l),0.)+vec3f(.03);}
+  col=col/(col+vec3f(.8));return vec4f(pow(max(col,vec3f(0.)),.vec3f(.4545)),1.0);
+}`;
+
+// ── Orchestrateur principal ──
+async function runFullBenchmark(device, fmt, ctx) {
+  const wrap = document.getElementById('scan-rows');
+
+  // Phase 1 : static limits (rapide)
+  const lim = (await navigator.gpu.requestAdapter({powerPreference:'high-performance'}))?.limits || {};
+
+  // Phase 2 : benchmark tiers du plus exigeant au plus léger
+  const tests = [
+    { idx:3, label:'ULTRA — Ray marcher',   run: ()=>benchShader(device,fmt,ctx,BENCH_RAYMARCH)  },
+    { idx:2, label:'HIGH  — Vortex 50k',    run: ()=>benchCompute(device,fmt,ctx)                },
+    { idx:1, label:'MID   — Plasma shader', run: ()=>benchShader(device,fmt,ctx,BENCH_PLASMA)    },
+    { idx:0, label:'LOW   — Lissajous',     run: ()=>benchShader(device,fmt,ctx,BENCH_LISSAJOUS) },
+  ];
+
+  const results = [];
+
+  for (const test of tests) {
+    // Ajoute la ligne "en cours"
+    const rowId = `bench-row-${test.idx}`;
+    const existing = document.getElementById(rowId);
+    if (!existing) {
+      wrap.insertAdjacentHTML('beforeend', `
+        <div id="${rowId}" style="display:flex;justify-content:space-between;align-items:center;width:min(480px,90vw);margin:3px 0">
+          <span style="font-size:9px;letter-spacing:.12em;color:rgba(255,255,255,.4)">${test.label}</span>
+          <span id="bench-val-${test.idx}" style="font-size:9px;letter-spacing:.12em;color:rgba(255,255,255,.3)">TEST...</span>
+        </div>
+        <div class="scan-line" style="margin-bottom:2px"><div class="scan-line-fill" id="bench-bar-${test.idx}"></div></div>
+      `);
+    }
+
+    const fps = await test.run();
+    results.push({idx:test.idx, fps});
+
+    // Met à jour la ligne avec le résultat
+    const pass = fps >= FPS_THRESHOLD;
+    const pct  = Math.min(100, Math.round(fps/120*100));
+    const color = pass ? '#4ade80' : fps > 35 ? '#facc15' : '#f87171';
+    document.getElementById(`bench-val-${test.idx}`).textContent = `${fps} FPS ${pass?'✓':'✗'}`;
+    document.getElementById(`bench-val-${test.idx}`).style.color = color;
+    document.getElementById(`bench-bar-${test.idx}`).style.cssText = `width:${pct}%;background:${color};transition:width .4s ease`;
+
+    // Dès qu'on trouve le premier tier qui passe, c'est notre winner
+    if (pass) {
+      return test.idx;
+    }
+  }
+
+  // Aucun tier ne passe → LOW par défaut
+  return 0;
 }
 
 /* ═══════════════════════════════════════════
@@ -228,30 +420,48 @@ async function main() {
 
   const adapter = await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
   if (!adapter) return;
-  const lim    = adapter.limits;
-  const info   = await adapter.requestAdapterInfo?.().catch(()=>({})) || {};
-  const tierIdx= detectTier(lim);
-  const T      = TIERS[tierIdx];
+  const lim  = adapter.limits;
+  const info = await adapter.requestAdapterInfo?.().catch(()=>({})) || {};
   const device = await adapter.requestDevice();
 
-  // Scan animé
-  await new Promise(r=>setTimeout(r,400));
+  // Configure le canvas principal MAINTENANT (avant le benchmark)
+  const canvas = document.getElementById('main-canvas');
+  canvas.style.display = 'block';
+  canvas.width  = window.innerWidth  * Math.min(devicePixelRatio,2);
+  canvas.height = window.innerHeight * Math.min(devicePixelRatio,2);
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  const ctx = canvas.getContext('webgpu');
+  ctx.configure({device, format:fmt});
+  window.addEventListener('resize',()=>{
+    canvas.width  = window.innerWidth  * Math.min(devicePixelRatio,2);
+    canvas.height = window.innerHeight * Math.min(devicePixelRatio,2);
+    ctx.configure({device,format:fmt});
+  });
+
+  // Spinner visible pendant le benchmark
+  document.getElementById('scan-spinner').style.display = 'block';
+  document.getElementById('scan-rows').innerHTML = `
+    <div style="font-size:9px;letter-spacing:.2em;color:rgba(255,255,255,.3);margin-bottom:12px;width:min(480px,90vw);text-align:left">
+      BENCHMARK GPU EN COURS — MESURE FPS RÉEL PAR TIER
+    </div>`;
+
+  // Lance le benchmark réel
+  const tierIdx = await runFullBenchmark(device, fmt, ctx);
+  const T = TIERS[tierIdx];
+
   document.getElementById('scan-spinner').style.display='none';
-  await runScan(adapter, lim);
 
   // Verdict
-  await new Promise(r=>setTimeout(r,300));
+  await new Promise(r=>setTimeout(r,400));
   const verdict = document.getElementById('scan-verdict');
-  verdict.textContent = T.label;
-  verdict.style.color  = T.color;
-  verdict.style.opacity= '1';
+  verdict.innerHTML = `<span style="font-size:clamp(12px,2vw,18px);letter-spacing:.1em;opacity:.5;display:block;margin-bottom:8px">TIER OPTIMAL DÉTECTÉ</span>${T.label}`;
+  verdict.style.color   = T.color;
+  verdict.style.opacity = '1';
 
-  await new Promise(r=>setTimeout(r,1400));
+  await new Promise(r=>setTimeout(r,1600));
   document.getElementById('scan').classList.add('done');
 
   // HUD
-  const canvas = document.getElementById('main-canvas');
-  canvas.style.display='block';
   document.getElementById('hud').style.display='block';
 
   document.getElementById('hud-tier').textContent = T.label;
@@ -291,11 +501,12 @@ async function main() {
       b.style.borderColor = bi===idx?t.color:'';
       b.style.color       = bi===idx?t.color:'';
     });
+    // Passe ctx et fmt déjà configurés
     switch(t.visual) {
-      case 'lissajous':  currentRenderer = await renderLissajous(canvas, device, t.color); break;
-      case 'plasma':     currentRenderer = await renderPlasma(canvas, device, t.color);    break;
-      case 'vortex':     currentRenderer = await renderVortex(canvas, device, t.color);    break;
-      case 'raymarcher': currentRenderer = await renderRaymarcher(canvas, device, t.color);break;
+      case 'lissajous':  currentRenderer = await renderLissajous(canvas, device, t.color, ctx, fmt); break;
+      case 'plasma':     currentRenderer = await renderPlasma(canvas, device, t.color, ctx, fmt);    break;
+      case 'vortex':     currentRenderer = await renderVortex(canvas, device, t.color, ctx, fmt);    break;
+      case 'raymarcher': currentRenderer = await renderRaymarcher(canvas, device, t.color, ctx, fmt);break;
     }
   }
 
@@ -317,10 +528,13 @@ function resizeCanvas(canvas) {
 
 function makeFmt(device, canvas) {
   const fmt = navigator.gpu.getPreferredCanvasFormat();
+  // Le canvas est déjà configuré par main() — on récupère juste le contexte existant
   const ctx = canvas.getContext('webgpu');
-  resizeCanvas(canvas);
-  ctx.configure({device, format:fmt});
-  window.addEventListener('resize',()=>{ resizeCanvas(canvas); ctx.configure({device,format:fmt}); });
+  if (!canvas._gpuReady) {
+    resizeCanvas(canvas);
+    ctx.configure({device, format:fmt});
+    canvas._gpuReady = true;
+  }
   return {ctx, fmt};
 }
 
@@ -358,9 +572,7 @@ function fullscreenPipeline(device, fmt, wgsl, unifSize) {
    Courbes vectorielles 2D, canvas 2D + timer
    (GPU minimal, compute pas nécessaire)
 ═══════════════════════════════════════════ */
-async function renderLissajous(canvas, device, accentColor) {
-  // WebGPU fragment shader — même contexte que les autres tiers, pas de Canvas2D
-  const {ctx, fmt} = makeFmt(device, canvas);
+async function renderLissajous(canvas, device, accentColor, ctx, fmt) {
   const col=[parseInt(accentColor.slice(1,3),16)/255,parseInt(accentColor.slice(3,5),16)/255,parseInt(accentColor.slice(5,7),16)/255];
 
   const wgsl=`
@@ -448,8 +660,7 @@ fn lissajous(uv:vec2f, a:f32, b:f32, delta:f32, t:f32) -> f32 {
    TIER MID — PLASMA
    Fragment shader pur, calculé pixel par pixel
 ═══════════════════════════════════════════ */
-async function renderPlasma(canvas, device, accentColor) {
-  const {ctx, fmt} = makeFmt(device, canvas);
+async function renderPlasma(canvas, device, accentColor, ctx, fmt) {
   const col = [parseInt(accentColor.slice(1,3),16)/255, parseInt(accentColor.slice(3,5),16)/255, parseInt(accentColor.slice(5,7),16)/255];
   const wgsl=`
 struct U{time:f32,rw:f32,rh:f32,cr:f32,cg:f32,cb:f32,p0:f32,p1:f32}
@@ -490,8 +701,7 @@ struct U{time:f32,rw:f32,rh:f32,cr:f32,cg:f32,cb:f32,p0:f32,p1:f32}
    TIER HIGH — VORTEX PARTICULES
    Compute + render, 50k particules
 ═══════════════════════════════════════════ */
-async function renderVortex(canvas, device, accentColor) {
-  const {ctx, fmt} = makeFmt(device, canvas);
+async function renderVortex(canvas, device, accentColor, ctx, fmt) {
   const col=[parseInt(accentColor.slice(1,3),16)/255,parseInt(accentColor.slice(3,5),16)/255,parseInt(accentColor.slice(5,7),16)/255];
   const nb=50000;
   const mb=device.createBuffer({size:8,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
@@ -574,8 +784,7 @@ struct V{@builtin(position) pos:vec4f,@location(0) uv:vec2f,@location(1) col:vec
    TIER ULTRA — RAY MARCHER 3D
    Scène SDF complète, ombres, AO, reflets
 ═══════════════════════════════════════════ */
-async function renderRaymarcher(canvas, device, accentColor) {
-  const {ctx, fmt} = makeFmt(device, canvas);
+async function renderRaymarcher(canvas, device, accentColor, ctx, fmt) {
   const col=[parseInt(accentColor.slice(1,3),16)/255,parseInt(accentColor.slice(3,5),16)/255,parseInt(accentColor.slice(5,7),16)/255];
   const wgsl=`
 struct U{time:f32,mx:f32,my:f32,rw:f32,rh:f32,cr:f32,cg:f32,cb:f32}
